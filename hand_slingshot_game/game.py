@@ -5,6 +5,7 @@ import math
 import random
 from dataclasses import dataclass
 
+import numpy as np
 import pygame
 
 # Game values are pixels / seconds and intentionally easy to tune.
@@ -13,9 +14,29 @@ GROUND_Y = 650
 SLING = pygame.Vector2(180, 530)
 PROJECTILE_RADIUS = 18
 GRAVITY = 900.0
-MAX_LAUNCH_SPEED = 850.0
-MAX_PULL_PIXELS = 110.0
+# Tuned so every target is reachable on draw distance alone: the hardest shot needs
+# ~0.70 power against a draw-only ceiling of ~0.75.  A fast throw is a bonus, not a tax.
+MAX_LAUNCH_SPEED = 1450.0
+MAX_PULL_PIXELS = 152.0          # Longer visible draw to match the extra range.
 MAX_TRAJECTORY_POINTS = 28
+CAMERA_INSET_WIDTH = 268         # Webcam preview is drawn inside the game window.
+RELOAD_DELAY = 0.7               # Seconds a landed ball stays put before the sling reloads.
+LEVEL_CLEAR_DELAY = 1.5          # Pause on a cleared level before the next one loads.
+
+# Each level is a name and its targets as (x, y, width, height, score).
+LEVELS = (
+    ("WARM UP", (
+        (850, 570, 46, 80, "100"),
+        (970, 530, 54, 120, "150"),
+        (1090, 590, 62, 60, "100"),
+    )),
+    ("LONG SHOT", (
+        (880, 590, 34, 60, "150"),
+        (985, 500, 38, 150, "200"),
+        (1100, 570, 40, 80, "200"),
+        (1200, 380, 34, 60, "250"),   # Floating: only a high, flat shot reaches it.
+    )),
+)
 
 # Visual palette: no external art assets are used.
 SKY = (126, 211, 255)
@@ -55,17 +76,33 @@ class SlingshotGame:
         self.reset()
 
     def reset(self) -> None:
-        self.projectile = SLING.copy()
-        self.velocity = pygame.Vector2()
-        self.flying = False
         self.score = 0
         self.shots = 0
+        self.completed = False
         self.particles: list[Particle] = []
-        self.targets = [
-            Target(pygame.Rect(850, 570, 46, 80), "100"),
-            Target(pygame.Rect(970, 530, 54, 120), "150"),
-            Target(pygame.Rect(1090, 590, 62, 60), "100"),
-        ]
+        self.load_level(0)
+
+    def load_level(self, index: int) -> None:
+        """Build a level's targets and put the ball back on the sling."""
+        self.level = index
+        self._clear_timer = 0.0
+        self.targets = [Target(pygame.Rect(x, y, w, h), label)
+                        for x, y, w, h, label in LEVELS[index][1]]
+        self.reload_sling()
+
+    def _update_levels(self, dt: float) -> None:
+        """Advance a beat after the last target falls, so the hit reads before the swap."""
+        if self.completed or any(target.alive for target in self.targets):
+            self._clear_timer = 0.0
+            return
+        self._clear_timer += dt
+        if self._clear_timer < LEVEL_CLEAR_DELAY:
+            return
+        if self.level + 1 < len(LEVELS):
+            self.load_level(self.level + 1)
+        else:
+            self.completed = True
+            self._clear_timer = 0.0
 
     @staticmethod
     def aim_direction(aim) -> pygame.Vector2:
@@ -103,6 +140,7 @@ class SlingshotGame:
             particle.life -= dt
             if particle.life <= 0:
                 self.particles.remove(particle)
+        self._update_levels(dt)
         if not self.flying:
             return
         self.velocity.y += GRAVITY * dt
@@ -121,6 +159,22 @@ class SlingshotGame:
                 self.score += int(target.label)
                 self.velocity *= 0.65
                 self._burst(ACCENT)
+        # Without this the shot never ends: `flying` stays set and every later launch is ignored.
+        if self.projectile.x - PROJECTILE_RADIUS > WIDTH or self.projectile.x + PROJECTILE_RADIUS < 0:
+            self.reload_sling()
+        elif self.velocity.length_squared() < 1.0:
+            self._rest_timer += dt
+            if self._rest_timer >= RELOAD_DELAY:
+                self.reload_sling()
+        else:
+            self._rest_timer = 0.0
+
+    def reload_sling(self) -> None:
+        """Return the ball to the sling so the next shot can be taken."""
+        self.projectile = SLING.copy()
+        self.velocity = pygame.Vector2()
+        self.flying = False
+        self._rest_timer = 0.0
 
     def _text(self, text: str, x: int, y: int, color=WHITE, font=None) -> None:
         active_font = font or self.font
@@ -188,12 +242,11 @@ class SlingshotGame:
         self._text(f"SHOTS {self.shots}", 1160, 63, ACCENT, self.small_font)
 
         steps = [
-            ("1", "Show open palm", state_name in ("AIMING", "DRAWING", "RELEASED", "COOLDOWN")),
-            ("2", "Close fist to grab", drawing),
-            ("3", "Move hand back", drawing),
-            ("4", "Open fist to launch", drawing),
+            ("1", "Show your hand", state_name in ("AIMING", "DRAWING", "RELEASED", "COOLDOWN")),
+            ("2", "Pull hand back", drawing),
+            ("3", "Throw forward", drawing),
         ]
-        panel = pygame.Rect(24, 128, 245, 180)
+        panel = pygame.Rect(24, 128, 245, 150)
         self._rounded_panel(panel, (25, 63, 84))
         self._text("HOW TO PLAY", 43, 145, (181, 214, 235), self.small_font)
         for index, (number, label, active) in enumerate(steps):
@@ -203,25 +256,61 @@ class SlingshotGame:
             self._text(number, 49, y, INK, self.small_font)
             self._text(label, 72, y, WHITE if active else (202, 220, 230), self.small_font)
 
+        name = LEVELS[self.level][0]
+        level_panel = pygame.Rect(0, 0, 330, 44)
+        level_panel.centerx, level_panel.y = WIDTH // 2, 22
+        self._rounded_panel(level_panel, (25, 63, 84))
+        heading = self.font.render(f"LEVEL {self.level + 1}/{len(LEVELS)}  ·  {name}", True, ACCENT)
+        self.screen.blit(heading, heading.get_rect(center=level_panel.center))
+
         status = "WEBCAM OFF — MOUSE FALLBACK" if not camera_ok else state_name.replace("_", " ")
         status_color = POWER if state_name == "DRAWING" else ACCENT
         self._rounded_panel(pygame.Rect(24, 604, 330, 34), (25, 63, 84))
         self._text(f"GESTURE: {status}", 40, 611, status_color, self.small_font)
-        if not self.flying and self.shots > 0:
-            self._text("Press R for a fresh round", 960, 665, INK, self.small_font)
         self._text("R restart   Esc quit", 25, 675, INK, self.small_font)
 
-    def draw(self, state_name: str, aim, pull: float, drawing: bool, camera_ok: bool) -> None:
+        if self.completed:
+            self._banner("ALL LEVELS CLEAR", f"FINAL SCORE {self.score} — PRESS R TO PLAY AGAIN")
+        elif not any(target.alive for target in self.targets):
+            self._banner("LEVEL CLEAR", "NEXT LEVEL LOADING")
+
+    def _banner(self, title: str, subtitle: str) -> None:
+        panel = pygame.Rect(0, 0, 580, 124)
+        panel.center = (WIDTH // 2, 296)
+        self._rounded_panel(panel, PANEL)
+        heading = self.title_font.render(title, True, ACCENT)
+        self.screen.blit(heading, heading.get_rect(center=(panel.centerx, panel.y + 46)))
+        detail = self.small_font.render(subtitle, True, WHITE)
+        self.screen.blit(detail, detail.get_rect(center=(panel.centerx, panel.y + 86)))
+
+    def _draw_camera_inset(self, frame) -> None:
+        """Blit the webcam frame into the bottom right, so the game needs one window."""
+        height, width = frame.shape[:2]
+        size = (CAMERA_INSET_WIDTH, int(height * CAMERA_INSET_WIDTH / width))
+        # OpenCV hands back BGR; reverse the channels and copy so the buffer is contiguous.
+        surface = pygame.image.frombuffer(np.ascontiguousarray(frame[:, :, ::-1]).tobytes(), (width, height), "RGB")
+        rect = pygame.Rect((0, 0), size)
+        rect.bottomright = (WIDTH - 26, GROUND_Y - 18)
+        border = rect.inflate(8, 8)
+        pygame.draw.rect(self.screen, PANEL, border, border_radius=12)
+        self.screen.blit(pygame.transform.smoothscale(surface, size), rect)
+        pygame.draw.rect(self.screen, WHITE, border, 2, border_radius=12)
+        self._text("CAMERA", rect.x + 8, rect.bottom - 22, WHITE, self.small_font)
+
+    def draw(self, state_name: str, aim, pull: float, power: float, drawing: bool, camera_ok: bool, frame=None) -> None:
         self._draw_background()
         direction = self.set_aiming_projectile(aim, pull, drawing) if not self.flying else self.aim_direction(aim)
         self._draw_slingshot(drawing)
         if drawing and not self.flying:
-            self._draw_trajectory(direction, pull)
+            # Preview with the launch power, not the band stretch, or the arc lies.
+            self._draw_trajectory(direction, power)
         self._draw_targets()
         for particle in self.particles:
             pygame.draw.circle(self.screen, particle.color, particle.position, max(2, int(5 * particle.life)))
         self._draw_projectile()
-        self._draw_hud(state_name, pull, drawing, camera_ok)
+        if frame is not None:
+            self._draw_camera_inset(frame)
+        self._draw_hud(state_name, power, drawing, camera_ok)
         pygame.display.flip()
 
     def close(self) -> None:

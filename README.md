@@ -15,9 +15,10 @@ and select GitHub Actions as the source. The included workflow publishes the
 browser game automatically whenever you push to main. It publishes the web
 folder.
 
-The live game asks for webcam permission. It also has a mouse mode, so it can be
-played without a camera: select Try with mouse, hold on the game to pull, and
-release to launch. Press R to restart.
+The live game asks for webcam permission. If more than one camera is connected, a
+Camera dropdown appears next to the buttons so you can pick which one to use. It
+also has a mouse mode, so it can be played without a camera: select Try with
+mouse, hold on the game to pull, and release to launch. Press R to restart.
 
 For a local preview, serve the web folder with a static web server. Camera
 access requires localhost or HTTPS.

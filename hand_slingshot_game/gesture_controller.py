@@ -10,14 +10,31 @@ import numpy as np
 
 from hand_tracker import HandData
 
-# Gesture thresholds / timing.  Hysteresis and stability times prevent one-frame shots.
-FIST_CLOSE_THRESHOLD = 0.68       # Enter DRAWING only above this closedness.
-FIST_OPEN_THRESHOLD = 0.38        # Release only below this, giving hysteresis.
-CLOSE_STABLE_MS = 80              # Fist must be steadily closed before grab.
-MIN_DRAW_MS = 150                 # User-requested minimum grab duration before launch.
-COOLDOWN_MS = 500                 # Ignore gestures after every launch.
-MAX_DEPTH_PULL = 0.38             # Size reduction relative to grab that equals full depth pull.
-MAX_FORWARD_SPEED = 1.40          # Palm-size/sec considered a full forward release speed.
+# Timing.  Hysteresis and stability windows prevent one-frame shots.
+MIN_DRAW_MS = 120                 # Minimum charge time before a throw can fire.
+COOLDOWN_MS = 450                 # Ignore gestures after every launch.
+
+# The draw is driven purely by hand depth, so no fist is needed to hold or throw the
+# ball.  Finger closedness is the noisiest signal MediaPipe gives us, so nothing
+# required depends on it any more.
+BASELINE_ALPHA = 0.03             # How fast the neutral hand distance re-centres.
+DRAW_ENTER = 0.07                 # Shrink below neutral that starts charging.
+DRAW_CANCEL = 0.02                # Drifting back inside this cancels without firing.
+MAX_DEPTH_PULL = 0.28             # Shrink below neutral that equals a full-power draw.
+MAX_FORWARD_SPEED = 1.60          # Palm-size/sec considered a full-speed throw.
+THRUST_TRIGGER = 0.34             # Fraction of MAX_FORWARD_SPEED that fires immediately.
+PULL_WEIGHT = 0.70                # Draw distance dominates power; the throw adds the rest.
+MIN_LAUNCH_POWER = 0.18           # An uncharged flick still lobs the ball a little.
+
+# A slow forward move fires too: releasing this much of the draw counts as a throw, so
+# the shot never depends on being fast enough, only on having charged something first.
+MIN_CHARGED_PULL = 0.18           # Draw that must exist before a forward move can fire.
+RELEASE_FRACTION = 0.45           # Fraction of the peak draw given back that launches.
+
+# Optional convenience trigger: opening a hand that happened to be closed also fires.
+# It is never required, and never contributes to power.
+FIST_HELD_THRESHOLD = 0.70
+FIST_OPEN_THRESHOLD = 0.48
 
 
 class GestureState(Enum):
@@ -42,10 +59,11 @@ class GestureOutput:
 class GestureController:
     def __init__(self) -> None:
         self.state = GestureState.IDLE
-        self._close_started: Optional[float] = None
         self._draw_started: Optional[float] = None
         self._grab_size: Optional[float] = None
-        self._held_pull_strength = 0.0
+        self._baseline: Optional[float] = None
+        self._was_closed = False
+        self._peak_pull = 0.0
         self._last_size: Optional[float] = None
         self._last_time: Optional[float] = None
         self._cooldown_until = 0.0
@@ -54,13 +72,24 @@ class GestureController:
     def _empty(state: GestureState) -> GestureOutput:
         return GestureOutput(state, np.array([0.5, 0.5], dtype=np.float32))
 
+    def _power(self, thrust: float) -> float:
+        """Power comes from how far the ball was drawn, plus how hard it was thrown.
+
+        Fist closedness is deliberately absent: it gates whether the ball is held,
+        and letting it set power made every shot at least half strength.
+        """
+        charged = PULL_WEIGHT * self._peak_pull + (1.0 - PULL_WEIGHT) * thrust
+        return float(np.clip(MIN_LAUNCH_POWER + (1.0 - MIN_LAUNCH_POWER) * charged, 0.0, 1.0))
+
     def update(self, hand: Optional[HandData], now: Optional[float] = None) -> GestureOutput:
         now = time.perf_counter() if now is None else now
         if hand is None:
             if self.state is GestureState.COOLDOWN and now >= self._cooldown_until:
                 self.state = GestureState.IDLE
             elif self.state is not GestureState.COOLDOWN:
-                self.state, self._close_started, self._draw_started = GestureState.IDLE, None, None
+                # Losing the hand drops the draw and forgets where neutral was.
+                self.state, self._draw_started, self._baseline = GestureState.IDLE, None, None
+                self._peak_pull, self._was_closed = 0.0, False
             return self._empty(self.state)
 
         aim = hand.palm_center.copy()
@@ -81,31 +110,40 @@ class GestureController:
             self.state = GestureState.AIMING
 
         if self.state is GestureState.AIMING:
-            if hand.closedness >= FIST_CLOSE_THRESHOLD:
-                self._close_started = self._close_started or now
-                if (now - self._close_started) * 1000 >= CLOSE_STABLE_MS:
-                    self.state = GestureState.DRAWING
-                    self._draw_started, self._grab_size = now, hand.palm_size
-                    self._held_pull_strength = hand.closedness
-            else:
-                self._close_started = None
+            # Neutral hand distance re-centres slowly, so any seating position works
+            # and the draw never depends on an absolute palm size.
+            self._baseline = hand.palm_size if self._baseline is None else \
+                self._baseline + (hand.palm_size - self._baseline) * BASELINE_ALPHA
+            shrink = (self._baseline - hand.palm_size) / max(self._baseline, 1e-4)
+            if shrink >= DRAW_ENTER:
+                self.state = GestureState.DRAWING
+                self._draw_started, self._grab_size = now, self._baseline
+                self._peak_pull, self._was_closed = 0.0, False
             return GestureOutput(self.state, aim, pull_strength=hand.closedness)
 
-        # Depth increases away from camera: a smaller palm than at grab means pull back.
+        # Depth increases away from camera: a smaller palm than neutral means pulled back.
+        # The entry threshold is subtracted so charging starts from zero, not a step.
         depth_change = max(0.0, (self._grab_size - hand.palm_size) / max(self._grab_size, 1e-4))
-        depth_pull = min(depth_change / MAX_DEPTH_PULL, 1.0)
-        pull_strength = float(np.clip(hand.closedness, 0.0, 1.0))
-        # Finger closure and backwards depth movement both contribute to the elastic pull.
-        pull_distance = float(np.clip(0.60 * pull_strength + 0.40 * depth_pull, 0.0, 1.0))
-        # Preserve the closed-fist value: by the release frame fingers are open.
-        if hand.closedness > FIST_OPEN_THRESHOLD:
-            self._held_pull_strength = pull_strength
+        depth_pull = float(np.clip((depth_change - DRAW_ENTER) / max(MAX_DEPTH_PULL - DRAW_ENTER, 1e-4), 0.0, 1.0))
+        # Throwing forward shrinks the live draw, so power is charged from the peak reached.
+        self._peak_pull = max(self._peak_pull, depth_pull)
+        thrust = float(np.clip(size_speed / MAX_FORWARD_SPEED, 0.0, 1.0))
+        power = self._power(thrust)
         draw_ms = (now - self._draw_started) * 1000
-        if hand.closedness <= FIST_OPEN_THRESHOLD and draw_ms >= MIN_DRAW_MS:
-            forward_release_speed = float(np.clip(size_speed / MAX_FORWARD_SPEED, 0.0, 1.0))
-            pull_strength = self._held_pull_strength
-            power = float(np.clip(0.8 * pull_strength + 0.2 * forward_release_speed, 0.0, 1.0))
+        # Opening a hand that was closed still fires, but an open hand throws just as well.
+        if hand.closedness >= FIST_HELD_THRESHOLD:
+            self._was_closed = True
+        opened_fist = self._was_closed and hand.closedness <= FIST_OPEN_THRESHOLD
+        # Giving the draw back counts as a throw at any speed; a fast one just fires sooner.
+        released = (self._peak_pull >= MIN_CHARGED_PULL
+                    and (self._peak_pull - depth_pull) >= RELEASE_FRACTION * self._peak_pull)
+        if (thrust >= THRUST_TRIGGER or released or opened_fist) and draw_ms >= MIN_DRAW_MS:
             self.state, self._cooldown_until = GestureState.RELEASED, now + COOLDOWN_MS / 1000
-            return GestureOutput(self.state, aim, pull_strength, pull_distance, power, True,
-                                 np.array([forward_release_speed, pull_distance], dtype=np.float32))
-        return GestureOutput(self.state, aim, pull_strength, pull_distance)
+            return GestureOutput(self.state, aim, self._peak_pull, depth_pull, power, True,
+                                 np.array([thrust, self._peak_pull], dtype=np.float32))
+        # Only bail out when nothing meaningful was ever charged, so noise cannot misfire
+        # and a real draw is never silently thrown away.
+        if depth_change <= DRAW_CANCEL and self._peak_pull < MIN_CHARGED_PULL:
+            self.state, self._peak_pull, self._was_closed = GestureState.AIMING, 0.0, False
+            return GestureOutput(self.state, aim, pull_strength=hand.closedness)
+        return GestureOutput(self.state, aim, self._peak_pull, depth_pull, power)

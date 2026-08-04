@@ -12,15 +12,20 @@
       <section class="intro">
         <p class="eyebrow">WEBCAM ARCADE</p>
         <h1>Hand<br><span>Slingshot</span></h1>
-        <p class="lede">A camera-controlled slingshot game. Aim with an open palm, close your fist to pull back, then open it to fire.</p>
+        <p class="lede">A camera-controlled slingshot game. Aim with your hand, pull it back to charge, then throw forward to fire. No fist needed.</p>
         <div class="controls">
           <button id="start-camera" type="button">Enable camera</button>
           <button id="mouse-mode" type="button" class="secondary">Try with mouse</button>
+          <label id="camera-picker" hidden>
+            <span>Camera</span>
+            <select id="camera-select" aria-label="Select which camera to use"></select>
+          </label>
         </div>
         <p id="camera-status" class="status" aria-live="polite">Choose a control method to begin.</p>
         <ol class="steps">
-          <li><b>1</b> Show an open palm to aim</li><li><b>2</b> Close fist to grab</li>
-          <li><b>3</b> Move your hand back to pull</li><li><b>4</b> Open fist to launch</li>
+          <li><b>1</b> Show your hand to aim</li>
+          <li><b>2</b> Pull it back to charge</li>
+          <li><b>3</b> Throw forward to fire</li>
         </ol>
       </section>
       <section class="play-area" aria-label="Hand Slingshot game">
