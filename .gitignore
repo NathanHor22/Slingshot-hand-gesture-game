@@ -31,6 +31,3 @@ hand_slingshot_game/hand_landmarker.task
 Thumbs.db
 Desktop.ini
 .DS_Store
-
-# Local static-site test server cache
-.parcel-cache/
