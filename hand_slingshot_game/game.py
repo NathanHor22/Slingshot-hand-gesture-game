@@ -167,7 +167,7 @@ class SlingshotGame:
             sound_files = {
                 "selecting": ("selecting.mp3", MENU_HOVER_VOLUME),
                 "selected": ("selected.mp3", MENU_SELECT_VOLUME),
-                "collision": ("collision.mp3", COLLISION_VOLUME),
+                "collision": ("collision.ogg", COLLISION_VOLUME),
             }
             for name, (filename, volume) in sound_files.items():
                 sound = pygame.mixer.Sound(str(ASSETS / filename))
